@@ -422,8 +422,9 @@ needs_sync(#qistate{journal_handle  = JournalHdl,
         false -> confirms
     end.
 
-flush(State = #qistate { dirty_count = 0 }) -> State;
-flush(State)                                -> flush_journal(State).
+flush(State = #qistate { dirty_count = 0 })            -> State;
+flush(State = #qistate { journal_handle = undefined }) -> State;
+flush(State)                                           -> flush_journal(State).
 
 read(StartEnd, StartEnd, State) ->
     {[], State};
@@ -784,6 +785,8 @@ action_to_entry(RelSeq, Action, JEntries) ->
 maybe_flush_journal(State) ->
     maybe_flush_journal(infinity, State).
 
+maybe_flush_journal(_Hint, State = #qistate {journal_handle = undefined}) ->
+    State;
 maybe_flush_journal(Hint, State = #qistate { dirty_count = DCount,
                                              max_journal_entries = MaxJournal })
   when DCount > MaxJournal orelse (Hint =/= infinity andalso DCount > Hint) ->
