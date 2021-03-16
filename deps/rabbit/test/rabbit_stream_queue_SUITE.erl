@@ -27,7 +27,7 @@ suite() ->
 
 all() ->
     [
-     {group, single_node},
+     %% {group, single_node},
      {group, cluster_size_2},
      {group, cluster_size_3},
      {group, unclustered_size_3_1},
@@ -38,8 +38,9 @@ all() ->
 
 groups() ->
     [
-     {single_node, [], [restart_single_node] ++ all_tests()},
-     {cluster_size_2, [], all_tests()},
+     %% {single_node, [parallel], all_tests()},
+     %% {single_node, [], [restart_single_node] ++ all_tests()},
+     {cluster_size_2, [parallel], all_tests()},
      {cluster_size_3, [], all_tests() ++
           [delete_replica,
            delete_down_replica,
@@ -72,7 +73,7 @@ all_tests() ->
      delete_queue,
      publish,
      publish_confirm,
-     recover,
+     %% recover,
      consume_without_qos,
      consume,
      consume_offset,
@@ -172,7 +173,8 @@ merge_app_env(Config) ->
                                       {rabbit, [{core_metrics_gc_interval, 100}]}).
 
 end_per_testcase(Testcase, Config) ->
-    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_queues, []),
+    Q = ?config(queue_name, Config),
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]),
     Config1 = rabbit_ct_helpers:run_steps(
                 Config,
                 rabbit_ct_client_helpers:teardown_steps()),
@@ -256,14 +258,20 @@ declare_queue(Config) ->
     %% Test declare an existing queue
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                 declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
-
-    ?assertMatch([_], rpc:call(Server, supervisor, which_children,
-                               [osiris_server_sup])),
-
+    
+    ?assertMatch([_], find_queue_info(Config, [])),
+    
     %% Test declare an existing queue with different arguments
     ?assertExit(_, declare(Ch, Q, [])),
     ok.
 
+find_queue_info(Config, Keys) ->
+    Name = ?config(queue_name, Config),
+    QName = rabbit_misc:r(<<"/">>, queue, Name),
+    Infos = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue, info_all,
+                                         [<<"/">>, [name] ++ Keys]),
+    [Info] = [Props || Props <- Infos, lists:member({name, QName}, Props)],
+    Info.
 
 delete_queue(Config) ->
     [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
@@ -651,6 +659,8 @@ consume_timestamp_offset(Config) ->
     receive
         #'basic.consume_ok'{consumer_tag = <<"ctag">>} ->
             ok
+    after 5000 ->
+            exit(consume_ok_timeout)
     end,
 
     %% It has subscribed to a very old timestamp, so we will receive the whole stream
@@ -685,6 +695,8 @@ consume_timestamp_last_offset(Config) ->
     receive
         #'basic.consume_ok'{consumer_tag = <<"ctag">>} ->
             ok
+    after 5000 ->
+            exit(missing_consume_ok)
     end,
 
     receive
@@ -864,8 +876,7 @@ consume_from_last(Config) ->
     Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server),
     qos(Ch1, 10, false),
 
-    [Info] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                           info_all, [<<"/">>, [committed_offset]]),
+    Info = find_queue_info(Config, [committed_offset]),
 
     %% We'll receive data from the last committed offset, let's check that is not the
     %% first offset
@@ -917,8 +928,7 @@ consume_from_next(Config, Args) ->
     Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server),
     qos(Ch1, 10, false),
 
-    [Info] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                           info_all, [<<"/">>, [committed_offset]]),
+    Info = find_queue_info(Config, [committed_offset]),
 
     %% We'll receive data from the last committed offset, let's check that is not the
     %% first offset
@@ -935,6 +945,8 @@ consume_from_next(Config, Args) ->
     receive
         #'basic.consume_ok'{consumer_tag = <<"ctag">>} ->
              ok
+    after 10000 ->
+            exit(consume_ok_failed)
     end,
 
     %% Publish a few more
@@ -1245,14 +1257,8 @@ leader_failover(Config) ->
 
     rabbit_ct_helpers:await_condition(
       fun () ->
-              [Info] =
-                  lists:filter(
-                    fun(Props) ->
-                            QName = rabbit_misc:r(<<"/">>, queue, Q),
-                            lists:member({name, QName}, Props)
-                    end,
-                    rabbit_ct_broker_helpers:rpc(Config, 1, rabbit_amqqueue,
-                                                 info_all, [<<"/">>, [name, leader, members]])),
+              Info = find_queue_info(Config, [leader, members]),
+
               NewLeader = proplists:get_value(leader, Info),
               NewLeader =/= Server1
       end),
@@ -1309,14 +1315,7 @@ leader_failover_dedupe(Config) ->
     ct:pal("preinfo", []),
     rabbit_ct_helpers:await_condition(
       fun() ->
-              [Info] = lists:filter(
-                         fun(Props) ->
-                                 QName = rabbit_misc:r(<<"/">>, queue, Q),
-                                 lists:member({name, QName}, Props)
-                         end,
-                         rabbit_ct_broker_helpers:rpc(Config, PubNode, rabbit_amqqueue,
-                                                      info_all,
-                                                      [<<"/">>, [name, leader, members]])),
+              Info = find_queue_info(Q, [leader, members]),
               ct:pal("info ~p", [Info]),
               NewLeader = proplists:get_value(leader, Info),
               NewLeader =/= DownNode
@@ -1364,12 +1363,8 @@ initial_cluster_size_two(Config) ->
                  declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                   {<<"x-initial-cluster-size">>, long, 2}])),
 
-    [Info] = lists:filter(
-               fun(Props) ->
-                       lists:member({name, rabbit_misc:r(<<"/">>, queue, Q)}, Props)
-               end,
-               rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                            info_all, [<<"/">>, [name, leader, members]])),
+    Info = find_queue_info(Q, [leader, members]),
+
     ?assertEqual(Server1, proplists:get_value(leader, Info)),
     ?assertEqual(2, length(proplists:get_value(members, Info))),
 
@@ -1406,12 +1401,8 @@ leader_locator_client_local(Config) ->
                  declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                  {<<"x-queue-leader-locator">>, longstr, <<"client-local">>}])),
 
-    [Info] = lists:filter(
-               fun(Props) ->
-                       lists:member({name, rabbit_misc:r(<<"/">>, queue, Q)}, Props)
-               end,
-               rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                            info_all, [<<"/">>, [name, leader]])),
+    Info = find_queue_info(Config, [leader]),
+
     ?assertEqual(Server1, proplists:get_value(leader, Info)),
 
     ?assertMatch(#'queue.delete_ok'{},
@@ -1423,12 +1414,7 @@ leader_locator_client_local(Config) ->
                  declare(Ch2, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                  {<<"x-queue-leader-locator">>, longstr, <<"client-local">>}])),
 
-    [Info2] = lists:filter(
-                fun(Props) ->
-                        lists:member({name, rabbit_misc:r(<<"/">>, queue, Q)}, Props)
-                end,
-                rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                             info_all, [<<"/">>, [name, leader]])),
+    Info2 = find_queue_info(Config, [leader]),
     ?assertEqual(Server2, proplists:get_value(leader, Info2)),
 
     ?assertMatch(#'queue.delete_ok'{},
@@ -1440,12 +1426,8 @@ leader_locator_client_local(Config) ->
                  declare(Ch3, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                   {<<"x-queue-leader-locator">>, longstr, <<"client-local">>}])),
 
-    [Info3] = lists:filter(
-                fun(Props) ->
-                        lists:member({name, rabbit_misc:r(<<"/">>, queue, Q)}, Props)
-                end,
-                rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                             info_all, [<<"/">>, [name, leader]])),
+
+    Info3 = find_queue_info(Config, [leader]),
     ?assertEqual(Server3, proplists:get_value(leader, Info3)),
 
     ?assertMatch(#'queue.delete_ok'{},
@@ -1461,12 +1443,7 @@ leader_locator_random(Config) ->
                  declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                  {<<"x-queue-leader-locator">>, longstr, <<"random">>}])),
 
-    [Info] = lists:filter(
-               fun(Props) ->
-                       lists:member({name, rabbit_misc:r(<<"/">>, queue, Q)}, Props)
-               end,
-               rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                            info_all, [<<"/">>, [name, leader]])),
+    Info = find_queue_info(Q, [leader]),
     Leader = proplists:get_value(leader, Info),
 
     ?assertMatch(#'queue.delete_ok'{},
@@ -1481,12 +1458,7 @@ leader_locator_random(Config) ->
                            declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                                {<<"x-queue-leader-locator">>, longstr, <<"random">>}])),
 
-              [Info2] = lists:filter(
-                          fun(Props) ->
-                                  lists:member({name, rabbit_misc:r(<<"/">>, queue, Q)}, Props)
-                          end,
-                          rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                                       info_all, [<<"/">>, [name, leader]])),
+              Info2 = find_queue_info(Q, [leader]),
               Leader2 = proplists:get_value(leader, Info2),
 
               Leader =/= Leader2
@@ -1511,12 +1483,7 @@ leader_locator_least_leaders(Config) ->
                  declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                  {<<"x-queue-leader-locator">>, longstr, <<"least-leaders">>}])),
 
-    [Info] = lists:filter(
-               fun(Props) ->
-                       lists:member({name, rabbit_misc:r(<<"/">>, queue, Q)}, Props)
-               end,
-               rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                            info_all, [<<"/">>, [name, leader]])),
+    Info = find_queue_info(Config, [leader]),
     Leader = proplists:get_value(leader, Info),
 
     ?assert(lists:member(Leader, [Server2, Server3])).
@@ -1534,10 +1501,7 @@ leader_locator_policy(Config) ->
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
 
-    [Info] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                          info_all, [<<"/">>, [policy, operator_policy,
-                                                               effective_policy_definition,
-                                                               name, leader]]),
+    Info = find_queue_info(Q, [policy, operator_policy, effective_policy_definition, leader]),
 
     ?assertEqual(<<"leader-locator">>, proplists:get_value(policy, Info)),
     ?assertEqual('', proplists:get_value(operator_policy, Info)),
@@ -1554,12 +1518,7 @@ leader_locator_policy(Config) ->
               ?assertEqual({'queue.declare_ok', Q, 0, 0},
                            declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
 
-              [Info2] = lists:filter(
-                          fun(Props) ->
-                                  lists:member({name, rabbit_misc:r(<<"/">>, queue, Q)}, Props)
-                          end,
-                          rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                                       info_all, [<<"/">>, [name, leader]])),
+              Info2 = find_queue_info(Q, [leader]),
               Leader2 = proplists:get_value(leader, Info2),
               Leader =/= Leader2
       end, 10),
@@ -1588,9 +1547,7 @@ invalid_policy(Config) ->
            Config, 0, <<"ttl">>, <<"invalid_policy.*">>, <<"queues">>,
            [{<<"message-ttl">>, 5}]),
 
-    [Info] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                          info_all, [<<"/">>, [policy, operator_policy,
-                                                               effective_policy_definition]]),
+    Info = find_queue_info(Config, [policy, operator_policy, effective_policy_definition]),
 
     ?assertEqual('', proplists:get_value(policy, Info)),
     ?assertEqual('', proplists:get_value(operator_policy, Info)),
@@ -1610,9 +1567,7 @@ max_age_policy(Config) ->
            Config, 0, <<"age">>, <<"max_age_policy.*">>, <<"queues">>,
            [{<<"max-age">>, <<"1Y">>}]),
 
-    [Info] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                          info_all, [<<"/">>, [policy, operator_policy,
-                                                               effective_policy_definition]]),
+    Info = find_queue_info(Config, [policy, operator_policy, effective_policy_definition]),
 
     ?assertEqual(<<"age">>, proplists:get_value(policy, Info)),
     ?assertEqual('', proplists:get_value(operator_policy, Info)),
@@ -1636,13 +1591,12 @@ update_retention_policy(Config) ->
 
     {ok, Q0} = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue, lookup,
                                             [rabbit_misc:r(<<"/">>, queue, Q)]),
-    timer:sleep(1000),
+    timer:sleep(2000),
     ok = rabbit_ct_broker_helpers:set_policy(
            Config, 0, <<"retention">>, <<"update_retention_policy.*">>, <<"queues">>,
            [{<<"max-age">>, <<"1s">>}]),
-    timer:sleep(1000),
 
-    quorum_queue_utils:wait_for_max_messages(Config, Q, 1000),
+    quorum_queue_utils:wait_for_max_messages(Config, Q, 3000),
 
     {ok, Q1} = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue, lookup,
                                             [rabbit_misc:r(<<"/">>, queue, Q)]),
@@ -1662,8 +1616,7 @@ queue_info(Config) ->
 
     rabbit_ct_helpers:await_condition(
       fun() ->
-              [Info] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                                    info_all, [<<"/">>, [name, leader, online, members]]),
+              Info = find_queue_info(Config, [leader, online, members]),
               lists:member(proplists:get_value(leader, Info), Servers) andalso
                   (lists:sort(Servers) == lists:sort(proplists:get_value(members, Info))) andalso
                   (lists:sort(Servers) == lists:sort(proplists:get_value(online, Info)))
@@ -1680,9 +1633,7 @@ max_segment_size_policy(Config) ->
            Config, 0, <<"segment">>, <<"max_segment_size.*">>, <<"queues">>,
            [{<<"max-segment-size">>, 5000}]),
 
-    [Info] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                          info_all, [<<"/">>, [policy, operator_policy,
-                                                               effective_policy_definition]]),
+    Info = find_queue_info(Config, [policy, operator_policy, effective_policy_definition]),
 
     ?assertEqual(<<"segment">>, proplists:get_value(policy, Info)),
     ?assertEqual('', proplists:get_value(operator_policy, Info)),
@@ -1707,6 +1658,15 @@ delete_queues() ->
     [{ok, _} = rabbit_amqqueue:delete(Q, false, false, <<"dummy">>)
      || Q <- rabbit_amqqueue:list()].
 
+delete_testcase_queue(Name) ->
+    QName = rabbit_misc:r(<<"/">>, queue, Name),
+    case rabbit_amqqueue:lookup(QName) of
+        {ok, Q} ->
+            {ok, _} = rabbit_amqqueue:delete(Q, false, false, <<"dummy">>);
+        _ ->
+            ok
+    end.
+
 declare(Ch, Q) ->
     declare(Ch, Q, []).
 
@@ -1728,13 +1688,7 @@ check_leader_and_replicas(Config, Name, Members) ->
     QNameRes = rabbit_misc:r(<<"/">>, queue, Name),
     rabbit_ct_helpers:await_condition(
       fun() ->
-              [Info] = lists:filter(
-                         fun(Props) ->
-                                 lists:member({name, QNameRes}, Props)
-                         end,
-                         rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                                      info_all, [<<"/">>, [name, leader,
-                                                                           members]])),
+              Info = find_queue_info(Config, [leader, members]),
               ct:pal("~s members ~w ~p", [?FUNCTION_NAME, Members, Info]),
               lists:member(proplists:get_value(leader, Info), Members)
                   andalso (lists:sort(Members) == lists:sort(proplists:get_value(members, Info)))
